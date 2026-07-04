@@ -1,0 +1,50 @@
+# Virtual environment
+.venv/
+
+# Bundled wheels (large, re-downloaded via download_wheels.sh)
+wheels/
+
+# Playwright browser binaries (re-downloaded via setup.sh)
+browsers/
+
+# ChromaDB vector store (auto-regenerated on first run)
+chroma_db/
+
+# Generated test outputs (produced by Agent B at runtime)
+tests/generated/*.py
+
+# Agent outputs (produced at runtime)
+requirements_extracted.json
+reports/*.json
+
+# Environment / secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# pytest
+.pytest_cache/
+.cache/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Zip archive
+*.zip

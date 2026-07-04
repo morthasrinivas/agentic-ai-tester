@@ -1,0 +1,31 @@
+# LLM & Agent Framework
+langchain==0.2.16
+langchain-openai==0.1.25
+langchain-community==0.2.16
+langchain-chroma==0.1.4
+openai==1.51.0
+
+# Document Loading
+pdfplumber==0.11.4
+python-docx==1.1.2
+pypdf==5.0.1
+
+# Vector Store
+chromadb==0.5.18
+
+# Embeddings (open-source fallback, no API key needed)
+sentence-transformers==3.2.1
+
+# Playwright & Testing
+playwright==1.47.0
+pytest==8.3.3
+pytest-playwright==0.5.2
+
+# SQLite fix for RHEL/CentOS (system sqlite3 too old for ChromaDB)
+pysqlite3-binary>=0.5.0
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.9.2
+tenacity>=8.2.0,<9.0.0
+rich==13.9.2
