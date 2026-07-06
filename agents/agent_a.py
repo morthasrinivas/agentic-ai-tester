@@ -1,11 +1,11 @@
 """
 Agent A — Requirement Extractor
 
-Two modes:
-  1. Direct (default): Parses the SRS document structure directly using
-     core.srs_parser — instant, no LLM required, deterministic output.
-  2. LLM mode (--llm-extraction): Uses ChromaDB + LLM to extract requirements.
-     More flexible but much slower with local models.
+Loads the SRS document, ingests it into ChromaDB using sentence-transformer
+embeddings, then queries the vector store for each feature module and asks
+the LLM to emit structured TestRequirement objects.
+
+Requires an LLM (OpenAI or Ollama) — configure via .env.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import List
 
 from langchain.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -24,10 +23,9 @@ from core.embeddings import get_or_create_collection, ingest_chunks, query_colle
 from core.models import TestRequirement, RequirementsBundle
 from core.llm_factory import build_llm, llm_provider_name
 from core.json_utils import extract_json
-from core.srs_parser import parse_requirements
 
 
-# ── Known requirement IDs from the SRS ───────────────────────────────────────
+# ── Known requirement groups from the SRS ────────────────────────────────────
 REQUIREMENT_GROUPS = [
     ("FR-G",    "Global / Cross-Page",          "/"),
     ("FR-CB",   "Checkboxes",                   "/checkboxes"),
@@ -72,24 +70,25 @@ Given a section of a Software Requirements Specification (SRS) document,
 extract ALL testable requirements for the given feature and return them as a
 JSON array.
 
+Each item must conform exactly to this schema:
+{{
+  "req_id": "string  (e.g. FR-FA-02)",
+  "feature": "string",
+  "url_path": "string (relative path like /login)",
+  "description": "string",
+  "preconditions": ["string"],
+  "steps": [{{"action": "string", "expected": "string or null"}}],
+  "expected_outcome": "string",
+  "is_negative": boolean,
+  "is_edge_case": boolean,
+  "tags": ["string"]
+}}
+
 Rules:
-- Each item must conform exactly to this schema:
-  {{
-    "req_id": "string  (e.g. FR-FA-02)",
-    "feature": "string",
-    "url_path": "string (relative path like /login)",
-    "description": "string",
-    "preconditions": ["string"],
-    "steps": [{{"action": "string", "expected": "string or null"}}],
-    "expected_outcome": "string",
-    "is_negative": boolean,
-    "is_edge_case": boolean,
-    "tags": ["string"]
-  }}
 - Include both positive AND negative/edge case scenarios.
-- For non-deterministic behaviours (typos, dynamic content), mark is_edge_case=true.
+- For non-deterministic behaviours (typos, dynamic content), set is_edge_case=true.
 - Do NOT invent requirements not present in the context.
-- Return ONLY valid JSON — no markdown fences, no explanation.
+- Return ONLY a valid JSON array — no markdown fences, no explanation.
 """),
     ("human", """Feature group: {feature_name} (IDs starting with {req_prefix})
 URL path: {url_path}
@@ -109,13 +108,13 @@ def _build_llm():
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _extract_requirements_for_group(
-    llm: ChatOpenAI,
+    llm,
     collection,
     req_prefix: str,
     feature_name: str,
     url_path: str,
 ) -> List[TestRequirement]:
-    """Query ChromaDB for context about this feature, then ask LLM to extract requirements."""
+    """Query ChromaDB for SRS context then ask LLM to extract structured requirements."""
     query = f"{req_prefix} {feature_name} {url_path} functional requirements preconditions steps"
     context_chunks = query_collection(collection, query, n_results=6)
     context = "\n\n---\n\n".join(context_chunks)
@@ -128,8 +127,7 @@ def _extract_requirements_for_group(
         "context": context,
     })
 
-    raw = response.content.strip()
-    parsed = extract_json(raw)
+    parsed = extract_json(response.content.strip())
     if not isinstance(parsed, list):
         parsed = [parsed]
 
@@ -142,23 +140,22 @@ def _extract_requirements_for_group(
     return requirements
 
 
-def run(srs_path: Path | None = None, use_llm: bool = False) -> RequirementsBundle:
+def run(srs_path: Path | None = None) -> RequirementsBundle:
     """
     Main entry point for Agent A.
 
-    Args:
-        srs_path: Override the default SRS document path.
-        use_llm:  If True, use LLM-based extraction (slow with local models).
-                  If False (default), use the fast direct SRS parser.
+    1. Load the SRS document and ingest into ChromaDB.
+    2. For each requirement group, query the vector store and ask the LLM
+       to extract structured TestRequirement objects.
+    3. Save results to requirements_extracted.json and return the bundle.
     """
     from rich.console import Console
     from rich.progress import track
     console = Console()
 
     doc_path = srs_path or config.SRS_DOCX
-
-    # ── Always ingest into ChromaDB (for Agent C to use) ────────────────────
     console.print(f"\n[bold cyan]Agent A[/bold cyan] — Loading document: {doc_path.name}")
+
     text = load_document(doc_path)
     chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
     console.print(f"  Loaded {len(text):,} chars → {len(chunks)} chunks")
@@ -172,22 +169,18 @@ def run(srs_path: Path | None = None, use_llm: bool = False) -> RequirementsBund
     added = ingest_chunks(collection, chunks, doc_id_prefix="srs")
     console.print(f"  ChromaDB: {added} new chunks ingested (collection size: {collection.count()})")
 
-    # ── Extract requirements ──────────────────────────────────────────────────
-    if use_llm:
-        console.print(f"\n  [LLM mode] LLM provider: [bold]{llm_provider_name()}[/bold]")
-        llm = _build_llm()
-        all_requirements: List[TestRequirement] = []
-        console.print("  Extracting requirements per feature group (LLM)...")
-        for req_prefix, feature_name, url_path in track(REQUIREMENT_GROUPS, description="Extracting"):
-            try:
-                reqs = _extract_requirements_for_group(llm, collection, req_prefix, feature_name, url_path)
-                all_requirements.extend(reqs)
-            except Exception as exc:
-                console.print(f"  [yellow]Warning[/yellow]: {req_prefix} skipped — {exc}")
-    else:
-        console.print("  [Direct mode] Parsing requirements from SRS structure (no LLM needed)...")
-        all_requirements = parse_requirements(doc_path)
-        console.print(f"  Parsed {len(all_requirements)} requirements instantly")
+    llm = _build_llm()
+    console.print(f"  LLM provider: [bold]{llm_provider_name()}[/bold]")
+
+    all_requirements: List[TestRequirement] = []
+
+    console.print("\n  Extracting requirements per feature group...")
+    for req_prefix, feature_name, url_path in track(REQUIREMENT_GROUPS, description="Extracting"):
+        try:
+            reqs = _extract_requirements_for_group(llm, collection, req_prefix, feature_name, url_path)
+            all_requirements.extend(reqs)
+        except Exception as exc:
+            console.print(f"  [yellow]Warning[/yellow]: {req_prefix} skipped — {exc}")
 
     bundle = RequirementsBundle(
         source_document=doc_path.name,
