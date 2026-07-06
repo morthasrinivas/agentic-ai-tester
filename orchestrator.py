@@ -26,10 +26,11 @@ console = Console()
 
 
 def _print_banner():
+    from core.llm_factory import llm_provider_name
     console.print(Panel.fit(
         "[bold cyan]Agentic AI Tester[/bold cyan]\n"
         "Multi-Agent Playwright Test Generator\n"
-        f"[dim]Model: {config.LLM_MODEL}  |  Max iterations: {config.MAX_ITERATIONS}[/dim]",
+        f"[dim]LLM: {llm_provider_name()}  |  Max iterations: {config.MAX_ITERATIONS}[/dim]",
         border_style="cyan",
     ))
 

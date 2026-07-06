@@ -12,12 +12,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
 from core.models import RequirementsBundle, TestRequirement, ValidationReport
+from core.llm_factory import build_llm, llm_provider_name
+from core.json_utils import extract_json
 
 
 # ── Code generation prompt ────────────────────────────────────────────────────
@@ -53,14 +54,8 @@ Write a complete pytest file with all test cases."""),
 ])
 
 
-def _build_llm() -> ChatOpenAI:
-    if not config.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-    return ChatOpenAI(
-        model=config.LLM_MODEL,
-        temperature=config.LLM_TEMPERATURE,
-        api_key=config.OPENAI_API_KEY,
-    )
+def _build_llm():
+    return build_llm(json_mode=False)  # code generation — not JSON mode
 
 
 def _sanitize_module_name(feature_name: str) -> str:
@@ -89,9 +84,10 @@ def _generate_test_file(
         "fix_context": f"Fix instructions from review:\n{fix_context}" if fix_context else "",
     })
     code = response.content.strip()
-    code = re.sub(r"^```[a-z]*\n?", "", code, flags=re.MULTILINE)
-    code = re.sub(r"\n?```$", "", code, flags=re.MULTILINE)
-    return code
+    # Strip markdown fences but keep the code as-is (not JSON)
+    code = re.sub(r"^```[a-z]*\s*\n?", "", code, flags=re.MULTILINE)
+    code = re.sub(r"\n?```\s*$", "", code, flags=re.MULTILINE)
+    return code.strip()
 
 
 def _group_by_feature(requirements: List[TestRequirement]) -> Dict[str, List[TestRequirement]]:
@@ -145,6 +141,7 @@ def run(
     )
 
     llm = _build_llm()
+    console.print(f"  LLM provider: [bold]{llm_provider_name()}[/bold]")
     feature_groups = _group_by_feature(bundle.requirements)
     generated: Dict[str, Path] = {}
 
@@ -153,7 +150,23 @@ def run(
         if previous_report:
             fix_ctx = _build_fix_context(previous_report, feature_name)
 
-        code = _generate_test_file(llm, feature_name, reqs, fix_context=fix_ctx)
+        try:
+            code = _generate_test_file(llm, feature_name, reqs, fix_context=fix_ctx)
+        except Exception as exc:
+            console.print(f"  [yellow]Warning[/yellow]: {feature_name} generation failed — {exc}")
+            # Use existing file if present, otherwise generate a stub
+            filename = _sanitize_module_name(feature_name)
+            file_path = config.OUTPUT_DIR / filename
+            if file_path.exists():
+                generated[feature_name] = file_path
+                console.print(f"  [dim]Using existing file: {filename}[/dim]")
+            else:
+                stub = _make_stub(feature_name, reqs)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(stub)
+                generated[feature_name] = file_path
+            continue
+
         filename = _sanitize_module_name(feature_name)
         file_path = config.OUTPUT_DIR / filename
 
@@ -167,3 +180,25 @@ def run(
         f"{len(generated)} test files written to {config.OUTPUT_DIR}"
     )
     return generated
+
+
+def _make_stub(feature_name: str, reqs: List[TestRequirement]) -> str:
+    """Generate a minimal stub test file when LLM generation fails."""
+    class_name = re.sub(r"[^a-zA-Z0-9]", "", feature_name.title())
+    lines = [
+        f'"""Tests for {feature_name} — stub (LLM generation failed)"""',
+        "import pytest",
+        "from playwright.sync_api import Page, expect",
+        "",
+        f"class Test{class_name}:",
+    ]
+    for req in reqs[:5]:
+        fn = re.sub(r"[^a-z0-9]+", "_", req.description.lower())[:50]
+        lines += [
+            f"    def test_{fn}(self, page: Page, base_url: str):",
+            f'        """[{req.req_id}] {req.description}"""',
+            f"        page.goto(f'{{base_url}}{req.url_path}')",
+            "        expect(page).not_to_have_title('')",
+            "",
+        ]
+    return "\n".join(lines)

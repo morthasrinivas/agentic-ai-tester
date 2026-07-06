@@ -15,12 +15,13 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
 from core.embeddings import get_or_create_collection, query_collection
+from core.llm_factory import build_llm, llm_provider_name
+from core.json_utils import extract_json
 from core.models import (
     RequirementsBundle,
     TestRequirement,
@@ -72,14 +73,8 @@ Validate thoroughly and return the JSON report."""),
 ])
 
 
-def _build_llm() -> ChatOpenAI:
-    if not config.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-    return ChatOpenAI(
-        model=config.LLM_MODEL,
-        temperature=0.0,
-        api_key=config.OPENAI_API_KEY,
-    )
+def _build_llm():
+    return build_llm(temperature=0.0, json_mode=True)
 
 
 def _read_test_files(test_files: Dict[str, Path]) -> Dict[str, str]:
@@ -116,9 +111,7 @@ def _validate_file(
     })
 
     raw = response.content.strip()
-    raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\n?```$", "", raw, flags=re.MULTILINE)
-    return json.loads(raw)
+    return extract_json(raw)
 
 
 def _static_code_checks(test_code: str, test_file_name: str) -> List[ValidationIssue]:
@@ -192,6 +185,15 @@ def run(
     )
 
     llm = _build_llm()
+    console.print(f"  LLM provider: [bold]{llm_provider_name()}[/bold]")
+    # If test_files is empty but generated dir has files, pick them up
+    if not test_files:
+        for f in config.OUTPUT_DIR.glob("test_*.py"):
+            feature = f.stem.replace("test_", "").replace("_", " ").title()
+            test_files[feature] = f
+        if test_files:
+            console.print(f"  [dim]Auto-discovered {len(test_files)} test files from output directory[/dim]")
+
     test_code_map = _read_test_files(test_files)
 
     # Build per-feature requirement lookup

@@ -1,9 +1,11 @@
 """
 Agent A — Requirement Extractor
 
-Loads the SRS document, ingests it into ChromaDB, then queries
-the vector store to extract structured TestRequirement objects for
-every functional requirement mentioned in the SRS.
+Two modes:
+  1. Direct (default): Parses the SRS document structure directly using
+     core.srs_parser — instant, no LLM required, deterministic output.
+  2. LLM mode (--llm-extraction): Uses ChromaDB + LLM to extract requirements.
+     More flexible but much slower with local models.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ import re
 from pathlib import Path
 from typing import List
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -21,6 +22,9 @@ import config
 from core.doc_loader import load_document, chunk_text
 from core.embeddings import get_or_create_collection, ingest_chunks, query_collection
 from core.models import TestRequirement, RequirementsBundle
+from core.llm_factory import build_llm, llm_provider_name
+from core.json_utils import extract_json
+from core.srs_parser import parse_requirements
 
 
 # ── Known requirement IDs from the SRS ───────────────────────────────────────
@@ -99,16 +103,8 @@ Extract all testable requirements for this feature as a JSON array."""),
 ])
 
 
-def _build_llm() -> ChatOpenAI:
-    if not config.OPENAI_API_KEY:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. Please copy .env.example to .env and add your key."
-        )
-    return ChatOpenAI(
-        model=config.LLM_MODEL,
-        temperature=config.LLM_TEMPERATURE,
-        api_key=config.OPENAI_API_KEY,
-    )
+def _build_llm():
+    return build_llm(json_mode=True)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -133,11 +129,7 @@ def _extract_requirements_for_group(
     })
 
     raw = response.content.strip()
-    # Strip accidental markdown fences
-    raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\n?```$", "", raw, flags=re.MULTILINE)
-
-    parsed = json.loads(raw)
+    parsed = extract_json(raw)
     if not isinstance(parsed, list):
         parsed = [parsed]
 
@@ -150,22 +142,23 @@ def _extract_requirements_for_group(
     return requirements
 
 
-def run(srs_path: Path | None = None) -> RequirementsBundle:
+def run(srs_path: Path | None = None, use_llm: bool = False) -> RequirementsBundle:
     """
     Main entry point for Agent A.
 
-    1. Load the SRS document.
-    2. Ingest into ChromaDB (skipped if already done).
-    3. For each requirement group, extract structured TestRequirement objects.
-    4. Save to requirements_extracted.json and return the bundle.
+    Args:
+        srs_path: Override the default SRS document path.
+        use_llm:  If True, use LLM-based extraction (slow with local models).
+                  If False (default), use the fast direct SRS parser.
     """
     from rich.console import Console
     from rich.progress import track
     console = Console()
 
     doc_path = srs_path or config.SRS_DOCX
-    console.print(f"\n[bold cyan]Agent A[/bold cyan] — Loading document: {doc_path.name}")
 
+    # ── Always ingest into ChromaDB (for Agent C to use) ────────────────────
+    console.print(f"\n[bold cyan]Agent A[/bold cyan] — Loading document: {doc_path.name}")
     text = load_document(doc_path)
     chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
     console.print(f"  Loaded {len(text):,} chars → {len(chunks)} chunks")
@@ -179,16 +172,22 @@ def run(srs_path: Path | None = None) -> RequirementsBundle:
     added = ingest_chunks(collection, chunks, doc_id_prefix="srs")
     console.print(f"  ChromaDB: {added} new chunks ingested (collection size: {collection.count()})")
 
-    llm = _build_llm()
-    all_requirements: List[TestRequirement] = []
-
-    console.print("\n  Extracting requirements per feature group...")
-    for req_prefix, feature_name, url_path in track(REQUIREMENT_GROUPS, description="Extracting"):
-        try:
-            reqs = _extract_requirements_for_group(llm, collection, req_prefix, feature_name, url_path)
-            all_requirements.extend(reqs)
-        except Exception as exc:
-            console.print(f"  [yellow]Warning[/yellow]: {req_prefix} skipped — {exc}")
+    # ── Extract requirements ──────────────────────────────────────────────────
+    if use_llm:
+        console.print(f"\n  [LLM mode] LLM provider: [bold]{llm_provider_name()}[/bold]")
+        llm = _build_llm()
+        all_requirements: List[TestRequirement] = []
+        console.print("  Extracting requirements per feature group (LLM)...")
+        for req_prefix, feature_name, url_path in track(REQUIREMENT_GROUPS, description="Extracting"):
+            try:
+                reqs = _extract_requirements_for_group(llm, collection, req_prefix, feature_name, url_path)
+                all_requirements.extend(reqs)
+            except Exception as exc:
+                console.print(f"  [yellow]Warning[/yellow]: {req_prefix} skipped — {exc}")
+    else:
+        console.print("  [Direct mode] Parsing requirements from SRS structure (no LLM needed)...")
+        all_requirements = parse_requirements(doc_path)
+        console.print(f"  Parsed {len(all_requirements)} requirements instantly")
 
     bundle = RequirementsBundle(
         source_document=doc_path.name,

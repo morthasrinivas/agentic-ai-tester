@@ -35,8 +35,12 @@ CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── LLM Configuration ────────────────────────────────────────────────────────
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")        # cheaper default
+LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")        # used when OPENAI_API_KEY is set
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+
+# Local LLM via Ollama (used automatically when OPENAI_API_KEY is not set)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3")
 
 # Embedding model: "openai" uses text-embedding-3-small (needs API key)
 #                  "local"  uses sentence-transformers (no API key needed)
